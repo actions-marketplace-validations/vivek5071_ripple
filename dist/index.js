@@ -124,12 +124,16 @@ function estimateCost(model, promptTokens, completionTokens) {
     return (promptTokens / 1_000_000) * inputPer1M + (completionTokens / 1_000_000) * outputPer1M;
 }
 const FOCUS_MAP = {
-    'logical-errors': 'logical errors and incorrect behavior',
-    'security': 'security vulnerabilities, injection risks, and exposed secrets',
-    'error-handling': 'missing or inadequate error handling and silent failure paths',
+    'logical-errors': 'logical errors and incorrect behavior, including swapped arguments and off-by-one boundaries',
+    'security': 'security vulnerabilities: untrusted values interpolated into SQL, shell, or HTML rather than parameterized; ' +
+        'authorization parameters that are accepted but never checked against the resource being acted on; exposed secrets',
+    'error-handling': 'missing or inadequate error handling and silent failure paths, including discarded promise rejections',
     'broken-assumptions': 'broken assumptions about input shape, API contracts, and state',
-    'all': 'all of the above',
 };
+// 'all' is deliberately not a key above. It used to map to the literal string
+// "all of the above", which the prompt rendered with no list above it — so the
+// broadest setting gave the model the least guidance. Expand it instead.
+const ALL_FOCUS_AREAS = Object.values(FOCUS_MAP).join('; ');
 const FINDING_SCHEMA = {
     type: 'object',
     required: ['findings'],
@@ -186,15 +190,20 @@ function validateApiUrl(rawUrl, allowPrivateNetworks) {
 }
 function buildSystemPrompt(focusList) {
     const areas = focusList.includes('all')
-        ? FOCUS_MAP['all']
+        ? ALL_FOCUS_AREAS
         : focusList.map(f => FOCUS_MAP[f] ?? f).join('; ');
     return [
         'You are a senior engineer reviewing a pull request diff.',
         'Identify only concrete, actionable issues. Do not praise. Do not summarize.',
         `Focus: ${areas}.`,
         '',
-        'For each issue respond with JSON matching the FindingSchema.',
-        'If no issues found, return an empty findings array.',
+        // The json_schema response_format is rejected by several providers (Groq
+        // among them), and on fallback the model never sees FINDING_SCHEMA. Spell
+        // the shape out here so field names survive every negotiation mode.
+        'Respond with a JSON object of exactly this shape:',
+        '{"findings": [{"file": "<path>", "line": <integer or null>, "category": "<one of: logical-error, error-handling, security, broken-assumption>", "description": "<what is wrong>", "impact": "<what breaks in practice>", "fix": "<how to correct it>"}]}',
+        'Every key is required on every finding. Use "" rather than omitting a string.',
+        'If no issues found, return {"findings": []}.',
         'Only report issues visible in the diff. Do not speculate beyond the shown code.',
     ].join('\n');
 }
@@ -254,6 +263,13 @@ async function callLlm(apiUrl, apiKey, model, systemPrompt, userContent, timeout
         completionTokens: data.usage?.completion_tokens ?? 0,
     };
 }
+function firstString(...candidates) {
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim().length > 0)
+            return c;
+    }
+    return '';
+}
 function parseFindings(content, filePath) {
     try {
         const parsed = JSON.parse(content);
@@ -262,9 +278,12 @@ function parseFindings(content, filePath) {
                 file: typeof f.file === 'string' ? f.file : filePath,
                 line: typeof f.line === 'number' ? f.line : null,
                 category: f.category ?? 'logical-error',
-                description: String(f.description ?? ''),
-                impact: String(f.impact ?? ''),
-                fix: String(f.fix ?? ''),
+                // Providers without structured-output support paraphrase the key names.
+                // Fall back through the synonyms they actually emit before giving up,
+                // otherwise the finding renders as a heading with no body.
+                description: firstString(f.description, f.issue, f.message, f.problem, f.explanation, f.title),
+                impact: firstString(f.impact, f.consequence, f.effect),
+                fix: firstString(f.fix, f.suggestion, f.recommendation, f.remediation),
             }));
         }
     }
@@ -679,6 +698,15 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.splitFiles = splitFiles;
 exports.checkPrMinLines = checkPrMinLines;
 const micromatch_1 = __importDefault(__nccwpck_require__(3095));
+const ALWAYS_SKIP = [
+    '.github/**',
+    '**/*.lock',
+    '**/*.snap',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+    '.ripple.yml',
+];
 function splitFiles(files, config, impactedPaths) {
     let candidates;
     if (impactedPaths !== null) {
@@ -692,6 +720,10 @@ function splitFiles(files, config, impactedPaths) {
     if (config.includePatterns.length > 0) {
         candidates = candidates.filter(f => micromatch_1.default.isMatch(f.path, config.includePatterns));
     }
+    // Always skip these, on top of any user skip-patterns. Reviewing CI config
+    // and lockfiles burns tokens and reliably produces false positives — an LLM
+    // will read `${{ secrets.FOO }}` as a hardcoded credential.
+    candidates = candidates.filter(f => !micromatch_1.default.isMatch(f.path, ALWAYS_SKIP));
     if (config.skipPatterns.length > 0) {
         candidates = candidates.filter(f => !micromatch_1.default.isMatch(f.path, config.skipPatterns));
     }
@@ -813,6 +845,7 @@ function getInputs() {
         teamLead: core.getInput('team-lead') || '',
         botPatterns: (core.getInput('bot-patterns') || '')
             .split(',').map(p => p.trim()).filter(Boolean),
+        dryRun: core.getBooleanInput('dry-run'),
     };
 }
 function loadAiReviewConfig(repoRoot) {
@@ -926,6 +959,10 @@ async function run() {
                 `GitHub does not grant write access for fork PRs on the pull_request trigger — ` +
                 `review requests and comments are unavailable. ` +
                 `See https://github.com/${owner}/${repo}#fork-pr-support for the two-workflow setup.`);
+            if (inputs.dryRun) {
+                core.info('dry-run: skipping fork-PR warning comment');
+                return;
+            }
             try {
                 const forkBody = [
                     (0, comment_formatter_1.getReportCommentMarker)(),
@@ -998,16 +1035,30 @@ async function run() {
             `${report.owners.length} owners, ${report.runtimeMs}ms`);
         // 11. Post Ripple comment
         const commentBody = (0, comment_formatter_1.formatReport)(report);
-        await (0, comment_1.upsertComment)(octokit, owner, repo, pullNumber, commentBody);
+        if (inputs.dryRun) {
+            core.info('dry-run: skipping Ripple comment — report follows:\n' + commentBody);
+        }
+        else {
+            await (0, comment_1.upsertComment)(octokit, owner, repo, pullNumber, commentBody);
+        }
         // 12. Request reviews in gate mode
         if (!advisoryMode) {
-            await (0, review_requester_1.requestReviews)(octokit, owner, repo, pullNumber, safety.owners);
+            if (inputs.dryRun) {
+                core.info(`dry-run: would request reviews from ${safety.owners.map(o => `@${o.handle}`).join(', ') || '(none)'}`);
+            }
+            else {
+                await (0, review_requester_1.requestReviews)(octokit, owner, repo, pullNumber, safety.owners);
+            }
         }
         // 13. AI Review (if enabled in .ripple.yml)
         const aiReview = loadAiReviewConfig(repoRoot);
         const aiApiKey = core.getInput('ai-api-key');
         if (aiReview) {
-            if (!aiApiKey) {
+            if (inputs.dryRun) {
+                // AI review both costs API budget and posts comments — skip it wholesale in dry-run
+                core.info('dry-run: skipping AI review');
+            }
+            else if (!aiApiKey) {
                 core.warning('ai-review is enabled in .ripple.yml but ai-api-key input is not set — skipping');
             }
             else {

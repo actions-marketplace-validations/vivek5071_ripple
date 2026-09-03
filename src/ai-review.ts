@@ -19,12 +19,18 @@ function estimateCost(model: string, promptTokens: number, completionTokens: num
 }
 
 const FOCUS_MAP: Record<string, string> = {
-  'logical-errors': 'logical errors and incorrect behavior',
-  'security': 'security vulnerabilities, injection risks, and exposed secrets',
-  'error-handling': 'missing or inadequate error handling and silent failure paths',
+  'logical-errors': 'logical errors and incorrect behavior, including swapped arguments and off-by-one boundaries',
+  'security':
+    'security vulnerabilities: untrusted values interpolated into SQL, shell, or HTML rather than parameterized; ' +
+    'authorization parameters that are accepted but never checked against the resource being acted on; exposed secrets',
+  'error-handling': 'missing or inadequate error handling and silent failure paths, including discarded promise rejections',
   'broken-assumptions': 'broken assumptions about input shape, API contracts, and state',
-  'all': 'all of the above',
 }
+
+// 'all' is deliberately not a key above. It used to map to the literal string
+// "all of the above", which the prompt rendered with no list above it — so the
+// broadest setting gave the model the least guidance. Expand it instead.
+const ALL_FOCUS_AREAS = Object.values(FOCUS_MAP).join('; ')
 
 const FINDING_SCHEMA = {
   type: 'object',
@@ -95,7 +101,7 @@ export function validateApiUrl(rawUrl: string, allowPrivateNetworks: boolean): s
 
 function buildSystemPrompt(focusList: string[]): string {
   const areas = focusList.includes('all')
-    ? FOCUS_MAP['all']
+    ? ALL_FOCUS_AREAS
     : focusList.map(f => FOCUS_MAP[f] ?? f).join('; ')
 
   return [
@@ -103,8 +109,13 @@ function buildSystemPrompt(focusList: string[]): string {
     'Identify only concrete, actionable issues. Do not praise. Do not summarize.',
     `Focus: ${areas}.`,
     '',
-    'For each issue respond with JSON matching the FindingSchema.',
-    'If no issues found, return an empty findings array.',
+    // The json_schema response_format is rejected by several providers (Groq
+    // among them), and on fallback the model never sees FINDING_SCHEMA. Spell
+    // the shape out here so field names survive every negotiation mode.
+    'Respond with a JSON object of exactly this shape:',
+    '{"findings": [{"file": "<path>", "line": <integer or null>, "category": "<one of: logical-error, error-handling, security, broken-assumption>", "description": "<what is wrong>", "impact": "<what breaks in practice>", "fix": "<how to correct it>"}]}',
+    'Every key is required on every finding. Use "" rather than omitting a string.',
+    'If no issues found, return {"findings": []}.',
     'Only report issues visible in the diff. Do not speculate beyond the shown code.',
   ].join('\n')
 }
@@ -195,6 +206,13 @@ async function callLlm(
   }
 }
 
+function firstString(...candidates: unknown[]): string {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim().length > 0) return c
+  }
+  return ''
+}
+
 function parseFindings(content: string, filePath: string): Finding[] {
   try {
     const parsed = JSON.parse(content) as { findings?: unknown[] }
@@ -203,9 +221,12 @@ function parseFindings(content: string, filePath: string): Finding[] {
         file: typeof f.file === 'string' ? f.file : filePath,
         line: typeof f.line === 'number' ? f.line : null,
         category: f.category ?? 'logical-error',
-        description: String(f.description ?? ''),
-        impact: String(f.impact ?? ''),
-        fix: String(f.fix ?? ''),
+        // Providers without structured-output support paraphrase the key names.
+        // Fall back through the synonyms they actually emit before giving up,
+        // otherwise the finding renders as a heading with no body.
+        description: firstString(f.description, f.issue, f.message, f.problem, f.explanation, f.title),
+        impact: firstString(f.impact, f.consequence, f.effect),
+        fix: firstString(f.fix, f.suggestion, f.recommendation, f.remediation),
       }))
     }
   } catch { /* fall through to prose fallback */ }
